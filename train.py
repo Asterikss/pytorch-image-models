@@ -49,7 +49,6 @@ try:
 except ImportError:
     has_apex = False
 
-
 try:
     import wandb
     has_wandb = True
@@ -61,6 +60,12 @@ try:
     has_functorch = True
 except ImportError as e:
     has_functorch = False
+
+try:
+    from torch.utils.flop_counter import FlopCounterMode
+    has_flop_counter_mode = True
+except ImportError:
+    has_flop_counter_mode = False
 
 has_compile = hasattr(torch, 'compile')
 
@@ -390,6 +395,8 @@ group.add_argument('--wandb-tags', default=[], type=str, nargs='+',
                    help='wandb tags')
 group.add_argument('--wandb-resume-id', default='', type=str, metavar='ID',
                    help='If resuming a run, the id of the run in wandb')
+group.add_argument('--tflops-limit', type=float, default=None,
+                   help="how many total TFLOPs to stop trainig after")
 
 
 def _parse_args():
@@ -855,6 +862,26 @@ def main():
             f'Scheduled epochs: {num_epochs} {sched_explain}. '
             f'LR stepped per {"epoch" if lr_scheduler.t_in_epochs else "update"}.')
 
+    n_forward_backwards = None
+    curr_forward_backwards = None
+    if args.tflops_limit is not None:
+        assert has_flop_counter_mode, "TFLOPs limit specified but FlopCounterMode could not be imported."
+        if (isinstance(model, nn.Module)):
+            flops_counter = FlopCounterMode(display=False, depth=None)
+            input, _ = next(iter(loader_train))
+            _logger.info(f"Model input shape: {input.shape}")
+            with flops_counter:
+                    model(input).sum().backward()
+            total_flops_one_forwd_backwrd: int = flops_counter.get_total_flops()
+            _logger.info(f"Total TFLOPs one forward-backward: {total_flops_one_forwd_backwrd / 1e12}")
+            n_forward_backwards = args.tflops_limit // (total_flops_one_forwd_backwrd / 1e12)
+            _logger.info(f"Total forward-backwards: {n_forward_backwards}")
+            assert n_forward_backwards > 0, "Even one forward-backward pass exceeds the flop limit."
+        else:
+            _logger.warning(
+                "Since tflops-limit flag has been set, the model is expected to "
+                "be an instance of nn.Module, but it's not at this point.")
+
     results = []
     try:
         for epoch in range(start_epoch, num_epochs):
@@ -878,6 +905,8 @@ def main():
                 model_ema=model_ema,
                 mixup_fn=mixup_fn,
                 num_updates_total=num_epochs * updates_per_epoch,
+                n_forward_backwards=n_forward_backwards,
+                curr_forward_backwards=curr_forward_backwards,
             )
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
@@ -945,6 +974,11 @@ def main():
                 latest_results['validation'] = eval_metrics
             results.append(latest_results)
 
+            if n_forward_backwards: # args.tflops_limit
+                curr_forward_backwards = train_metrics["forward_backwards"]
+                if curr_forward_backwards >= n_forward_backwards:
+                    break
+
     except KeyboardInterrupt:
         pass
 
@@ -978,6 +1012,8 @@ def train_one_epoch(
         model_ema=None,
         mixup_fn=None,
         num_updates_total=None,
+        n_forward_backwards=None,
+        curr_forward_backwards=None,
 ):
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if args.prefetcher and loader.mixup_enabled:
@@ -1000,10 +1036,18 @@ def train_one_epoch(
     last_batch_idx = len(loader) - 1
     last_batch_idx_to_accum = len(loader) - last_accum_steps
 
+    curr_forward_backwards = curr_forward_backwards if curr_forward_backwards else 0
+
     data_start_time = update_start_time = time.time()
     optimizer.zero_grad()
     update_sample_count = 0
     for batch_idx, (input, target) in enumerate(loader):
+        if n_forward_backwards: # args.tflops_limit
+            if curr_forward_backwards >= n_forward_backwards:
+                _logger.info("FLOPs limit hit. Stopping...")
+                break
+            curr_forward_backwards += 1
+
         last_batch = batch_idx == last_batch_idx
         need_update = last_batch or (batch_idx + 1) % accum_steps == 0
         update_idx = batch_idx // accum_steps
@@ -1128,6 +1172,11 @@ def train_one_epoch(
         # synchronize avg loss, each process keeps its own running avg
         loss_avg = torch.tensor([loss_avg], device=device, dtype=torch.float32)
         loss_avg = utils.reduce_tensor(loss_avg, args.world_size).item()
+
+    if n_forward_backwards: # args.tflops_limit
+        _logger.info(f"Current forward-backwards: {curr_forward_backwards=}")
+        return OrderedDict([('loss', loss_avg), ('forward_backwards', curr_forward_backwards)])
+
     return OrderedDict([('loss', loss_avg)])
 
 
